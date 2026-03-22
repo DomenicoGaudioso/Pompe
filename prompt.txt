@@ -1,0 +1,38 @@
+Sviluppare e mantenere una web app professionale in Python e Streamlit per il calcolo
+del grado di riempimento di una condotta circolare in moto uniforme (formula di Manning).
+
+STATO ATTUALE (v2 — 2026-03-22)
+La versione attuale è completa nei requisiti di base. Funzionalità implementate:
+- DatiCondotta (dataclass frozen) con D, n, S, Q.
+- valida_dati(): controlla D, n, S, Q con messaggi esplicativi.
+- theta_from_y(), area_perimetro(): geometria sezione circolare.
+- manning_Q(): formula di Manning.
+- risolvi_y_per_Q(): bisezione nel ramo monotono β ∈ [0, 0.938].
+- stato_condotta(): dizionario con y, β, A, P, Rh, V, Q_max, Q_full.
+- portata_massima(): massimo Q con 500 punti di campionamento.
+- portata_piena_sezione(): Q a β = 1.0.
+- curva_riempimento(): DataFrame 80 punti con y/D, y, Q, V, A, P, Rh.
+- commenti_progettuali(): note automatiche su β, V, n.
+- app.py: layout wide, 5 metriche, 3 tab (Risultati / Grafici / Note), 2 grafici Plotly,
+  marcatura punto di progetto, download CSV.
+
+STANDARD DELLA SUITE
+- Tutta la logica di calcolo in `src.py`. Nessuna formula in `app.py`.
+- Grafici esclusivamente con Plotly.
+- Interfaccia in italiano.
+- Dataclass frozen per gli input.
+- Validazioni robuste con st.stop() in caso di errore.
+- Tab: Risultati / Grafici / Note tecniche.
+- Export CSV.
+
+ESTENSIONI FUTURE PRIORITARIE
+1. Confronto fra più diametri (sweep D).
+2. Sezioni non circolari (ovoidale, rettangolare).
+3. Modalità inversa: dato β, calcolare Q o D.
+4. Preset materiali tipici (n per PVC, cls, grès).
+5. Report PDF con parametri e grafici.
+
+REQUISITI DI CODICE
+- Non rompere la separazione src.py / app.py.
+- Aggiornare sempre readme.md e prompt.txt dopo ogni iterazione.
+- Mantenere le funzioni esistenti compatibili con le loro segnature.
