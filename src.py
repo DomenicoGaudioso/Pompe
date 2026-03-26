@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-CONDOTTE - Calcolo idraulico sezione circolare (moto uniforme, Manning)
+POMPE - Calcolo della prevalenza (TDH) e potenza richiesta.
 Versione professionale:
-- Geometria e idraulica completa della sezione circolare
-- Libreria materiali con n di Manning e velocita massima
-- Diametri DN standard (EN 476 / ISO)
-- Confronto automatico diametri adiacenti
-- Numero di Froude, classificazione del moto, energia specifica
-- Tabella verifiche normative (beta, V_min, V_max, Fr, margine)
-- Curva idraulica completa Q(beta), V(beta), A(beta)
+- Perdite distribuite (Darcy-Weisbach, Swamee-Jain; laminare: f = 64/Re)
+- Perdite concentrate (somma K)
+- NPSH disponibile e verifica cavitazione
+- Velocita specifica Ns e classificazione tipo pompa
+- Colpo d'ariete: sovrapressione Joukowsky
+- Costo energetico annuo
+- Curva sistema TDH(Q)
 - Tabella passaggi di calcolo
+- Verifiche normative complete
 - Generazione report PDF
 """
 from __future__ import annotations
@@ -17,78 +18,68 @@ from __future__ import annotations
 import datetime
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-G = 9.81  # accelerazione di gravita [m/s²]
+G = 9.81
+P_ATM_STD = 101_325.0  # Pa (pressione atmosferica standard)
 
 
 # ---------------------------------------------------------------------------
-# Libreria materiali (n Manning e V_max [m/s])
+# Librerie preset fluidi (rho, nu, p_vap a T di riferimento)
 # ---------------------------------------------------------------------------
 
-MATERIALI_MANNING: Dict[str, dict] = {
-    "PVC / PE liscio (HDPE)": {
-        "n": 0.010, "V_max": 5.0,
-        "note": "Condotte plastiche nuove. Massima efficienza idraulica.",
+FLUIDI_PRESET: Dict[str, dict] = {
+    "Acqua 5 deg C": {
+        "rho": 999.9, "nu": 1.518e-6, "p_vap": 872,
+        "note": "Acqua di falda fredda",
     },
-    "Gres ceramico smaltato": {
-        "n": 0.011, "V_max": 4.5,
-        "note": "Fognatura mista o nera; eccellente resistenza all'abrasione.",
+    "Acqua 10 deg C": {
+        "rho": 999.7, "nu": 1.307e-6, "p_vap": 1228,
+        "note": "Acqua tipica invernale",
     },
-    "Calcestruzzo liscio (prefabbricato)": {
-        "n": 0.012, "V_max": 6.0,
-        "note": "Tubi in calcestruzzo prefabbricato, buone condizioni.",
+    "Acqua 15 deg C": {
+        "rho": 999.1, "nu": 1.140e-6, "p_vap": 1705,
+        "note": "Temperatura ambiente fresca",
     },
-    "Ghisa sferoidale (duttile)": {
-        "n": 0.013, "V_max": 4.0,
-        "note": "Condotte in pressione e gravita. Lunga vita utile.",
+    "Acqua 20 deg C (std)": {
+        "rho": 998.2, "nu": 1.004e-6, "p_vap": 2338,
+        "note": "Condizione standard di riferimento",
     },
-    "Acciaio rivestito (epossidico)": {
-        "n": 0.012, "V_max": 5.0,
-        "note": "Acciaio con rivestimento interno in resina epossidica.",
+    "Acqua 40 deg C": {
+        "rho": 992.2, "nu": 0.658e-6, "p_vap": 7384,
+        "note": "Acqua calda (impianti termici)",
     },
-    "Calcestruzzo armato (scatolare)": {
-        "n": 0.015, "V_max": 4.0,
-        "note": "Culvert, scatolari, canali in calcestruzzo armato.",
+    "Acqua 60 deg C": {
+        "rho": 983.2, "nu": 0.474e-6, "p_vap": 19_940,
+        "note": "Acqua calda sanitaria / riscaldamento",
     },
-    "HDPE corrugato (doppia parete)": {
-        "n": 0.018, "V_max": 4.0,
-        "note": "HDPE a parete corrugata esterna / liscia interna.",
+    "Acqua 80 deg C": {
+        "rho": 971.8, "nu": 0.364e-6, "p_vap": 47_360,
+        "note": "Impianti riscaldamento alta temperatura",
     },
-    "Acciaio non rivestito / vecchio": {
-        "n": 0.020, "V_max": 3.0,
-        "note": "Condotte metalliche degradate, rugosita elevata.",
+    "Gasolio (diesel)": {
+        "rho": 840.0, "nu": 3.5e-6, "p_vap": 100,
+        "note": "Carburante industriale, stazioni di pompaggio",
     },
-    "Muratura in mattoni": {
-        "n": 0.020, "V_max": 2.5,
-        "note": "Fognature storiche. Rugosita variabile. Da ispezionare.",
-    },
-    "Fibrocemento (storico)": {
-        "n": 0.011, "V_max": 4.0,
-        "note": "ATTENZIONE: materiale contenente amianto. Non usare in nuove opere.",
+    "Olio minerale leggero": {
+        "rho": 870.0, "nu": 20.0e-6, "p_vap": 10,
+        "note": "Lubrificanti industriali, idraulica",
     },
 }
 
-# ---------------------------------------------------------------------------
-# Diametri nominali DN standard (EN 476 / ISO) [m]
-# ---------------------------------------------------------------------------
-
-DN_STANDARD_M: List[float] = [
-    0.100, 0.125, 0.150, 0.200, 0.250, 0.300, 0.350, 0.400, 0.450, 0.500,
-    0.600, 0.700, 0.800, 0.900, 1.000, 1.100, 1.200, 1.400, 1.600, 1.800,
-    2.000, 2.200, 2.400, 2.600, 2.800, 3.000,
-]
-
-# Velocita minima autocircolante per tipo di uso [m/s]
-V_MIN_AUTOCIRCOLANTE: Dict[str, float] = {
-    "Fognatura nera (acque reflue)": 0.60,
-    "Fognatura mista": 0.70,
-    "Acque meteoriche / pluviali": 0.50,
-    "Irrigazione / acquedotto": 0.30,
-    "Generico": 0.40,
+# Rugosita assoluta per materiale tubo [m]
+RUGOSITA_TUBI: Dict[str, float] = {
+    "PVC / PE liscio": 0.000_002,
+    "Acciaio senza saldatura (lappato)": 0.000_046,
+    "Acciaio saldato": 0.000_046,
+    "Ghisa sferoidale rivestita": 0.000_100,
+    "Ghisa grigia vecchia": 0.000_500,
+    "Calcestruzzo liscio": 0.000_300,
+    "Calcestruzzo rugoso": 0.001_000,
+    "Ferro zincato": 0.000_150,
 }
 
 
@@ -97,439 +88,408 @@ V_MIN_AUTOCIRCOLANTE: Dict[str, float] = {
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class DatiCondotta:
-    D: float    # diametro [m]
-    n: float    # coeff. di Manning [-]
-    S: float    # pendenza idraulica [-]
-    Q: float    # portata di progetto [m³/s]
+class Fluido:
+    rho: float = 998.2     # densita [kg/m³]
+    nu: float = 1.004e-6   # viscosita cinematica [m²/s]
+    p_vap: float = 2338.0  # pressione di vapore [Pa]
+
+
+@dataclass(frozen=True)
+class Linea:
+    L: float       # lunghezza [m]
+    D: float       # diametro interno [m]
+    eps: float     # rugosita assoluta [m]
+    K_tot: float   # somma coefficienti perdite concentrate [-]
+    z: float       # quota di riferimento [m]
 
 
 # ---------------------------------------------------------------------------
 # Validazione
 # ---------------------------------------------------------------------------
 
-def valida_dati(dati: DatiCondotta) -> List[str]:
+def valida_dati(Q: float, suction: Linea, discharge: Linea,
+                fluido: Fluido, eta: float) -> List[str]:
     errori: List[str] = []
-    if dati.D <= 0:
-        errori.append("Il diametro D deve essere maggiore di 0 m.")
-    if dati.n <= 0 or dati.n > 0.05:
-        errori.append("Il coefficiente di Manning n deve essere compreso tra 0.005 e 0.05.")
-    if dati.S <= 0:
-        errori.append("La pendenza idraulica S deve essere positiva.")
-    if dati.Q <= 0:
+    if Q <= 0:
         errori.append("La portata Q deve essere positiva.")
+    if fluido.rho <= 0:
+        errori.append("La densita' del fluido deve essere positiva.")
+    if fluido.nu <= 0:
+        errori.append("La viscosita' cinematica deve essere positiva.")
+    for nome, linea in [("aspirazione", suction), ("mandata", discharge)]:
+        if linea.L <= 0:
+            errori.append(f"La lunghezza della linea di {nome} deve essere positiva.")
+        if linea.D <= 0:
+            errori.append(f"Il diametro della linea di {nome} deve essere positivo.")
+        if linea.eps < 0:
+            errori.append(f"La rugosita' della linea di {nome} non puo' essere negativa.")
+        if linea.K_tot < 0:
+            errori.append(f"La somma K concentrati ({nome}) non puo' essere negativa.")
+    if not (0 < eta <= 1.0):
+        errori.append("Il rendimento eta deve essere compreso tra 0 e 1.")
     return errori
 
 
 # ---------------------------------------------------------------------------
-# Geometria sezione circolare
+# Calcoli idraulici di base
 # ---------------------------------------------------------------------------
 
-def theta_from_y(y: float, D: float) -> float:
-    """Angolo al centro theta [rad] corrispondente al tirante y."""
-    if y <= 0:
-        return 0.0
-    if y >= D:
-        return math.pi
-    cos_theta = max(-1.0, min(1.0, 1.0 - 2.0 * y / D))
-    return math.acos(cos_theta)
+def velocity(Q: float, D: float) -> float:
+    return Q / (math.pi * D ** 2 / 4.0)
 
 
-def area_perimetro(y: float, D: float) -> Tuple[float, float]:
-    """Area bagnata A [m²] e perimetro bagnato P [m] per sezione circolare."""
-    R = D / 2.0
-    theta = theta_from_y(y, D)
-    A = 0.5 * R * R * (2.0 * theta - math.sin(2.0 * theta))
-    P = 2.0 * R * theta
-    return A, P
-
-
-def larghezza_superficie_libera(y: float, D: float) -> float:
-    """Larghezza della superficie libera T [m] per sezione circolare."""
-    if y <= 0 or y >= D:
-        return 0.0
-    R = D / 2.0
-    return 2.0 * math.sqrt(max(0.0, R ** 2 - (R - y) ** 2))
-
-
-# ---------------------------------------------------------------------------
-# Formula di Manning e Froude
-# ---------------------------------------------------------------------------
-
-def manning_Q(A: float, P: float, n: float, S: float) -> float:
-    if P <= 0 or n <= 0 or S <= 0:
-        return 0.0
-    Rh = A / P
-    return (1.0 / n) * A * (Rh ** (2.0 / 3.0)) * (S ** 0.5)
-
-
-def numero_froude(V: float, A: float, T: float) -> float:
-    """Numero di Froude per sezione parzialmente piena: Fr = V / sqrt(g * A/T)."""
-    if T <= 0 or A <= 0:
+def reynolds(V: float, D: float, nu: float) -> float:
+    if D <= 0 or nu <= 0:
         return float("nan")
-    D_idraulico = A / T
-    return V / math.sqrt(G * D_idraulico)
+    return V * D / nu
 
 
-def classifica_moto(Fr: float) -> str:
-    """Classificazione del regime del moto."""
-    if math.isnan(Fr):
+def friction_factor(eps_rel: float, Re: float) -> float:
+    """f = 64/Re (laminare, Re<2300) oppure Swamee-Jain (turbolento)."""
+    if Re <= 0:
+        return float("nan")
+    if Re < 2300:
+        return 64.0 / Re
+    return 0.25 / (math.log10(eps_rel / 3.7 + 5.74 / (Re ** 0.9)) ** 2)
+
+
+def head_loss_friction(L: float, D: float, V: float, f: float) -> float:
+    return f * (L / D) * (V * V) / (2.0 * G)
+
+
+def head_loss_minor(K: float, V: float) -> float:
+    return K * (V * V) / (2.0 * G)
+
+
+# ---------------------------------------------------------------------------
+# Calcolo TDH
+# ---------------------------------------------------------------------------
+
+def tdh_pump(Q: float, suction: Linea, discharge: Linea,
+             fluido: Fluido, p_s: float = 0.0, p_d: float = 0.0) -> dict:
+    V_s = velocity(Q, suction.D)
+    V_d = velocity(Q, discharge.D)
+    Re_s = reynolds(V_s, suction.D, fluido.nu)
+    Re_d = reynolds(V_d, discharge.D, fluido.nu)
+    f_s = friction_factor(suction.eps / suction.D, Re_s)
+    f_d = friction_factor(discharge.eps / discharge.D, Re_d)
+    hf_s = head_loss_friction(suction.L, suction.D, V_s, f_s)
+    hf_d = head_loss_friction(discharge.L, discharge.D, V_d, f_d)
+    hK_s = head_loss_minor(suction.K_tot, V_s)
+    hK_d = head_loss_minor(discharge.K_tot, V_d)
+    dZ = discharge.z - suction.z
+    dVel = (V_d ** 2 - V_s ** 2) / (2.0 * G)
+    dP = (p_d - p_s) / (fluido.rho * G)
+    H = dZ + hf_s + hf_d + hK_s + hK_d + dVel + dP
+    return dict(H=H, V_s=V_s, V_d=V_d, Re_s=Re_s, Re_d=Re_d,
+                f_s=f_s, f_d=f_d, hf_s=hf_s, hf_d=hf_d,
+                hK_s=hK_s, hK_d=hK_d, dZ=dZ, dVel=dVel, dP=dP)
+
+
+def potenza_pompa(Q: float, H: float, rho: float = 998.2, eta: float = 0.75) -> float:
+    if eta <= 0:
+        return float("nan")
+    return rho * G * Q * H / eta
+
+
+# ---------------------------------------------------------------------------
+# NPSH disponibile
+# ---------------------------------------------------------------------------
+
+def npsh_disponibile(z_serbatoio: float, z_pompa: float,
+                     hf_asp_tot: float,
+                     rho: float = 998.2,
+                     p_atm: float = P_ATM_STD,
+                     p_vap: float = 2338.0) -> float:
+    """
+    NPSH disponibile [m c.a.]:
+    NPSH_d = (p_atm - p_vap) / (rho * g) + (z_serbatoio - z_pompa) - hf_asp
+    dove hf_asp = perdite totali nel tratto di aspirazione.
+    Riferimento: ISO 9906:2012, EN 12845.
+    """
+    p_term = (p_atm - p_vap) / (rho * G)
+    z_term = z_serbatoio - z_pompa
+    return p_term + z_term - hf_asp_tot
+
+
+# ---------------------------------------------------------------------------
+# Velocita specifica e tipo di pompa
+# ---------------------------------------------------------------------------
+
+def velocita_specifica_ns(n_rpm: float, Q: float, H: float) -> float:
+    """
+    Velocita specifica Ns = n * Q^0.5 / H^0.75
+    [giri/min, m³/s, m] -> valore adimensionale o in rpm-m3/4/s1/2.
+    Riferimento: Stepanoff, Kaplan, KSB Pump Handbook.
+    """
+    if H <= 0 or Q <= 0 or n_rpm <= 0:
+        return float("nan")
+    return n_rpm * (Q ** 0.5) / (H ** 0.75)
+
+
+def tipo_pompa_da_ns(Ns: float) -> str:
+    """Classificazione del tipo di pompa dalla velocita specifica Ns."""
+    if math.isnan(Ns):
         return "n.d."
-    if abs(Fr - 1.0) <= 0.05:
-        return "Critico (Fr ~ 1)"
-    return "Subcritico (Fr < 1)" if Fr < 1.0 else "Supercritico (Fr > 1)"
-
-
-def energia_specifica(V: float, y: float) -> float:
-    """Energia specifica E = y + V²/(2g) [m]."""
-    return y + V ** 2 / (2.0 * G)
-
-
-# ---------------------------------------------------------------------------
-# Risoluzione numerica y(Q) — bisezione
-# ---------------------------------------------------------------------------
-
-def risolvi_y_per_Q(D: float, n: float, S: float, Q_target: float,
-                    tol: float = 1e-8, max_iter: int = 300) -> float:
-    """Risolve y dato Q_target per una sezione circolare con Manning (bisezione)."""
-    y_max_search = 0.938 * D
-    a, b = 1e-9, y_max_search
-    Q_a = manning_Q(*area_perimetro(a, D), n, S)
-    Q_b = manning_Q(*area_perimetro(b, D), n, S)
-    if Q_target <= Q_a:
-        return a
-    if Q_target >= Q_b:
-        return b
-    ya, yb = a, b
-    for _ in range(max_iter):
-        ym = 0.5 * (ya + yb)
-        Qm = manning_Q(*area_perimetro(ym, D), n, S)
-        if abs(Qm - Q_target) < tol:
-            return ym
-        if Qm < Q_target:
-            ya = ym
-        else:
-            yb = ym
-    return 0.5 * (ya + yb)
-
-
-def portata_massima(D: float, n: float, S: float, n_punti: int = 500) -> float:
-    """Portata massima nella sezione circolare (beta ~ 0.938)."""
-    Q_max = 0.0
-    for i in range(1, n_punti):
-        y = i / n_punti * D
-        A, P = area_perimetro(y, D)
-        Q = manning_Q(A, P, n, S)
-        if Q > Q_max:
-            Q_max = Q
-    return Q_max
-
-
-def portata_piena_sezione(D: float, n: float, S: float) -> float:
-    """Portata a sezione piena (beta = 1.0)."""
-    A, P = area_perimetro(D, D)
-    return manning_Q(A, P, n, S)
+    if Ns < 400:
+        return "Centrifuga radiale (alta prevalenza, bassa portata)"
+    if Ns < 1200:
+        return "Centrifuga mista (normale)"
+    if Ns < 3000:
+        return "Centrifuga a flusso misto (alta portata)"
+    if Ns < 8000:
+        return "Elicoidale / assiale (bassa prevalenza, alta portata)"
+    return "Assiale pura (pompe fluviali / di drenaggio)"
 
 
 # ---------------------------------------------------------------------------
-# Stato della condotta al punto di progetto
+# Colpo d'ariete (Joukowsky)
 # ---------------------------------------------------------------------------
 
-def stato_condotta(dati: DatiCondotta) -> dict:
-    y = risolvi_y_per_Q(dati.D, dati.n, dati.S, dati.Q)
-    A, P = area_perimetro(y, dati.D)
-    Rh = A / P if P > 0 else float("nan")
-    V = dati.Q / A if A > 0 else float("nan")
-    beta = y / dati.D
-    T = larghezza_superficie_libera(y, dati.D)
-    Fr = numero_froude(V, A, T)
-    E = energia_specifica(V, y)
-    Q_max = portata_massima(dati.D, dati.n, dati.S)
-    Q_full = portata_piena_sezione(dati.D, dati.n, dati.S)
-    return dict(y=y, beta=beta, A=A, P=P, Rh=Rh, V=V, T=T,
-                Fr=Fr, E=E, Q_max=Q_max, Q_full=Q_full)
+def sovrapressione_joukowsky(V: float, rho: float = 998.2,
+                              a_onda: float = 1200.0) -> dict:
+    """
+    Sovrapressione da colpo d'ariete (chiusura istantanea valvola):
+    dP = rho * a_onda * V  [Pa]
+    Velocita d'onda a_onda dipende dal materiale e dalla condotta.
+    Riferimento: EN 805:2000, Wylie & Streeter (1993).
+    """
+    dP_Pa = rho * a_onda * V
+    dP_bar = dP_Pa / 1e5
+    dP_mcol = dP_Pa / (rho * G)
+    return {
+        "dP [Pa]": dP_Pa,
+        "dP [bar]": dP_bar,
+        "dP [m c.a.]": dP_mcol,
+        "a_onda [m/s]": a_onda,
+    }
+
+
+# Velocita d'onda tipiche per materiale [m/s]
+VELOCITA_ONDA_MATERIALE: Dict[str, float] = {
+    "Acciaio": 1300.0,
+    "Ghisa sferoidale": 1200.0,
+    "PVC rigido": 350.0,
+    "PE/HDPE": 300.0,
+    "Calcestruzzo armato": 1000.0,
+    "Vetroresina (GRP)": 700.0,
+}
 
 
 # ---------------------------------------------------------------------------
-# Curva idraulica completa
+# Costo energetico annuo
 # ---------------------------------------------------------------------------
 
-def curva_riempimento(D: float, n: float, S: float, n_punti: int = 80) -> pd.DataFrame:
-    """Curva idraulica completa per la sezione circolare."""
+def costo_energetico_annuo(P_kW: float, ore_annue: float = 2000.0,
+                            costo_kwh: float = 0.15,
+                            rendimento_motore: float = 0.92) -> dict:
+    """
+    Costo energetico annuo considerando anche il rendimento del motore elettrico.
+    P_assorbita_motore = P_idraulica / (eta_pompa gia' inclusa in P_kW) / eta_motore
+    -> In realta P_kW e' gia' la potenza all'asse; divido per eta_motore per la potenza elettrica.
+    """
+    P_elettrica_kW = P_kW / rendimento_motore
+    energia_annua_kWh = P_elettrica_kW * ore_annue
+    costo_annuo = energia_annua_kWh * costo_kwh
+    return {
+        "P_idraulica [kW]": P_kW * rendimento_motore,  # potenza utile all'acqua
+        "P_asse [kW]": P_kW,
+        "P_elettrica [kW]": P_elettrica_kW,
+        "Ore annue": ore_annue,
+        "Energia annua [kWh]": energia_annua_kWh,
+        "Costo unitario [EUR/kWh]": costo_kwh,
+        "Costo annuo [EUR]": costo_annuo,
+        "Rendimento motore": rendimento_motore,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Breakdown perdite per componente
+# ---------------------------------------------------------------------------
+
+def breakdown_perdite(res: dict) -> pd.DataFrame:
+    """Tabella riassuntiva dei contributi alla prevalenza totale."""
+    rows = [
+        {"Componente": "Dislivello geodesico dZ",        "Valore [m]": round(res["dZ"], 4)},
+        {"Componente": "Perdite distribuite asp. hf_s",  "Valore [m]": round(res["hf_s"], 4)},
+        {"Componente": "Perdite concentrate asp. hK_s",  "Valore [m]": round(res["hK_s"], 4)},
+        {"Componente": "Perdite distribuite mand. hf_d", "Valore [m]": round(res["hf_d"], 4)},
+        {"Componente": "Perdite concentrate mand. hK_d", "Valore [m]": round(res["hK_d"], 4)},
+        {"Componente": "Variazione cinetica dV^2/(2g)",  "Valore [m]": round(res["dVel"], 4)},
+        {"Componente": "TDH totale",                      "Valore [m]": round(res["H"], 4)},
+    ]
+    df = pd.DataFrame(rows)
+    df["% su TDH"] = (df["Valore [m]"] / res["H"] * 100).round(1).where(res["H"] != 0, None)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Curva sistema TDH(Q)
+# ---------------------------------------------------------------------------
+
+def curva_tdh_vs_Q(suction: Linea, discharge: Linea, fluido: Fluido,
+                   Q_ref: float, n_punti: int = 50) -> pd.DataFrame:
+    """Curva del sistema TDH(Q) da 0.10*Q_ref a 2.0*Q_ref."""
     records = []
-    for i in range(1, n_punti + 1):
-        beta = i / n_punti
-        y = beta * D
-        A, P = area_perimetro(y, D)
-        Q = manning_Q(A, P, n, S)
-        V = Q / A if A > 0 else 0.0
-        Rh = A / P if P > 0 else 0.0
-        T = larghezza_superficie_libera(y, D)
-        Fr = numero_froude(V, A, T)
-        E = energia_specifica(V, y)
+    for Q in np.linspace(0.10 * Q_ref, 2.0 * Q_ref, n_punti):
+        r = tdh_pump(float(Q), suction, discharge, fluido)
+        perdite_tot = r["hf_s"] + r["hf_d"] + r["hK_s"] + r["hK_d"]
+        P = potenza_pompa(float(Q), r["H"], fluido.rho, 0.75)  # eta=0.75 per curva
         records.append({
-            "y/D [-]": round(beta, 4),
-            "y [m]": round(y, 5),
-            "Q [m3/s]": round(Q, 6),
-            "V [m/s]": round(V, 4),
-            "A [m2]": round(A, 6),
-            "P [m]": round(P, 5),
-            "Rh [m]": round(Rh, 5),
-            "T [m]": round(T, 5),
-            "Fr [-]": round(Fr, 4) if not math.isnan(Fr) else None,
-            "E [m]": round(E, 5),
+            "Q [m3/s]":           round(float(Q), 5),
+            "TDH [m]":            round(r["H"], 3),
+            "V asp [m/s]":        round(r["V_s"], 3),
+            "V mand [m/s]":       round(r["V_d"], 3),
+            "Perdite tot [m]":    round(perdite_tot, 3),
+            "dZ [m]":             round(r["dZ"], 3),
         })
     return pd.DataFrame(records)
-
-
-# ---------------------------------------------------------------------------
-# Confronto diametri DN standard
-# ---------------------------------------------------------------------------
-
-def confronto_diametri(n: float, S: float, Q: float,
-                       D_ref: float,
-                       materiale: str = "Calcestruzzo liscio (prefabbricato)",
-                       uso: str = "Fognatura nera (acque reflue)") -> pd.DataFrame:
-    """
-    Confronta i diametri DN standard nell'intervallo 0.5*D_ref -- 2.5*D_ref.
-    Per ciascun diametro calcola beta, V, Q_max, Fr e verifica le condizioni.
-    """
-    D_list = [d for d in DN_STANDARD_M if 0.5 * D_ref <= d <= 2.5 * D_ref]
-    V_max = MATERIALI_MANNING.get(materiale, {}).get("V_max", 5.0)
-    V_min = V_MIN_AUTOCIRCOLANTE.get(uso, 0.60)
-    records = []
-    for D in D_list:
-        try:
-            dati_d = DatiCondotta(D=D, n=n, S=S, Q=Q)
-            if valida_dati(dati_d):
-                continue
-            res_d = stato_condotta(dati_d)
-            beta = res_d["beta"]
-            V = res_d["V"]
-            Q_max = res_d["Q_max"]
-            Fr = res_d["Fr"]
-
-            ok_beta = beta <= 0.80
-            ok_V = V_min <= V <= V_max
-            ok_Q = Q <= Q_max
-            stato = "OK" if (ok_beta and ok_V and ok_Q) else (
-                "ATTENZIONE" if (beta <= 0.94 and ok_Q) else "NON OK")
-            sel = "<<< DN progetto" if abs(D - D_ref) < 0.001 else ""
-
-            records.append({
-                "DN [mm]": int(round(D * 1000)),
-                "beta [-]": round(beta, 3),
-                "V [m/s]": round(V, 3),
-                "Fr [-]": round(Fr, 3) if not math.isnan(Fr) else None,
-                "Q_max [m3/s]": round(Q_max, 4),
-                "Q/Q_max [-]": round(Q / Q_max, 3),
-                "OK beta": "SI" if ok_beta else "NO",
-                "OK V": "SI" if ok_V else "NO",
-                "Stato globale": stato,
-                "Nota": sel,
-            })
-        except Exception:
-            continue
-    return pd.DataFrame(records)
-
-
-# ---------------------------------------------------------------------------
-# Verifiche normative (tabella semaforo)
-# ---------------------------------------------------------------------------
-
-def verifiche_idrauliche(dati: DatiCondotta, res: dict,
-                         materiale: str = "Calcestruzzo liscio (prefabbricato)",
-                         uso: str = "Fognatura nera (acque reflue)") -> pd.DataFrame:
-    """
-    Tabella di verifica normativa completa della condotta.
-    Restituisce colonne: Verifica, Valore, Limite, Esito, Riferimento.
-    Esito puo' essere: OK | ATTENZIONE | NON OK | INFO.
-    """
-    mat = MATERIALI_MANNING.get(materiale, {})
-    V_max_mat = mat.get("V_max", 5.0)
-    V_min = V_MIN_AUTOCIRCOLANTE.get(uso, 0.60)
-
-    beta = res["beta"]
-    V = res["V"]
-    Q = dati.Q
-    Q_max = res["Q_max"]
-    Q_full = res["Q_full"]
-    Fr = res["Fr"]
-    E = res["E"]
-    Rh = res["Rh"]
-    y = res["y"]
-    margine = Q_full / Q if Q > 0 else float("nan")
-    regime = classifica_moto(Fr)
-
-    Fr_str = f"{Fr:.4f}" if not math.isnan(Fr) else "n.d."
-    esito_Fr = (("OK" if Fr < 0.95 else "ATTENZIONE") if Fr < 1.0 else
-                ("ATTENZIONE" if Fr < 1.05 else "NON OK")) if not math.isnan(Fr) else "INFO"
-
-    checks = [
-        {
-            "N.": 1,
-            "Verifica": "Grado di riempimento beta <= 0.80",
-            "Valore calcolato": f"{beta:.4f}",
-            "Limite / soglia": "<= 0.80",
-            "Esito": "OK" if beta <= 0.80 else ("ATTENZIONE" if beta <= 0.94 else "NON OK"),
-            "Riferimento normativo": "DIN EN 1671:2011, EN 476:2011",
-        },
-        {
-            "N.": 2,
-            "Verifica": f"Velocita min. autocircolante V >= {V_min:.2f} m/s",
-            "Valore calcolato": f"{V:.4f} m/s",
-            "Limite / soglia": f">= {V_min:.2f} m/s",
-            "Esito": "OK" if V >= V_min else "NON OK",
-            "Riferimento normativo": "DIN EN 1671:2011 - ASCE MOP 36",
-        },
-        {
-            "N.": 3,
-            "Verifica": f"Velocita max. materiale V <= {V_max_mat:.1f} m/s",
-            "Valore calcolato": f"{V:.4f} m/s",
-            "Limite / soglia": f"<= {V_max_mat:.1f} m/s",
-            "Esito": "OK" if V <= V_max_mat else "NON OK",
-            "Riferimento normativo": f"Scheda tecnica materiale ({materiale})",
-        },
-        {
-            "N.": 4,
-            "Verifica": "Q progetto <= Q_max (beta = 0.94)",
-            "Valore calcolato": f"{Q:.5f} m3/s",
-            "Limite / soglia": f"<= {Q_max:.5f} m3/s",
-            "Esito": "OK" if Q <= Q_max else "NON OK",
-            "Riferimento normativo": "Idraulica sezione circolare",
-        },
-        {
-            "N.": 5,
-            "Verifica": "Regime di moto subcritico (Fr < 1.0)",
-            "Valore calcolato": Fr_str,
-            "Limite / soglia": "Fr < 1.0",
-            "Esito": esito_Fr,
-            "Riferimento normativo": "Idraulica canali in pressione",
-        },
-        {
-            "N.": 6,
-            "Verifica": "Margine capacita' Q_full / Q >= 1.25",
-            "Valore calcolato": f"{margine:.3f}",
-            "Limite / soglia": ">= 1.25",
-            "Esito": "OK" if margine >= 1.25 else "ATTENZIONE",
-            "Riferimento normativo": "Linee guida ISPRA / buona pratica",
-        },
-        {
-            "N.": 7,
-            "Verifica": "Rapporto Q/Q_max [-]",
-            "Valore calcolato": f"{Q / Q_max:.4f}",
-            "Limite / soglia": "<= 1.0",
-            "Esito": "OK" if Q <= Q_max else "NON OK",
-            "Riferimento normativo": "Verifica di portata",
-        },
-        {
-            "N.": 8,
-            "Verifica": "Energia specifica E = y + V2/(2g)",
-            "Valore calcolato": f"{E:.5f} m",
-            "Limite / soglia": "INFO",
-            "Esito": "INFO",
-            "Riferimento normativo": "Idraulica di base",
-        },
-        {
-            "N.": 9,
-            "Verifica": "Regime di moto classificato",
-            "Valore calcolato": regime,
-            "Limite / soglia": "Subcritico preferito",
-            "Esito": "INFO",
-            "Riferimento normativo": "Classificazione idraulica",
-        },
-        {
-            "N.": 10,
-            "Verifica": "Pendenza minima autocircolante (V = V_min)",
-            "Valore calcolato": f"S progetto = {dati.S:.6f}",
-            "Limite / soglia": f"S >= S_min per V={V_min:.2f} m/s",
-            "Esito": "OK" if V >= V_min else "ATTENZIONE",
-            "Riferimento normativo": "DIN EN 1671:2011",
-        },
-    ]
-    return pd.DataFrame(checks)
 
 
 # ---------------------------------------------------------------------------
 # Tabella passaggi di calcolo
 # ---------------------------------------------------------------------------
 
-def tabella_passaggi(dati: DatiCondotta, res: dict) -> pd.DataFrame:
-    """Tabella con tutti i passaggi intermedi del calcolo idraulico."""
-    R = dati.D / 2.0
-    y = res["y"]
-    beta = res["beta"]
-    theta = theta_from_y(y, dati.D)
-    A = res["A"]
-    P = res["P"]
-    Rh = res["Rh"]
-    V = res["V"]
-    T = res["T"]
-    Fr = res["Fr"]
-    E = res["E"]
-    Q_calc = manning_Q(A, P, dati.n, dati.S)
-    Q_max = res["Q_max"]
-    Q_full = res["Q_full"]
-
-    D_idr_val = A / T if T > 0 else float("nan")
-    Q_Qmax  = dati.Q / Q_max  if Q_max  > 0 else float("nan")
-    Q_Qfull = dati.Q / Q_full if Q_full > 0 else float("nan")
+def tabella_passaggi(Q: float, suction: Linea, discharge: Linea,
+                     fluido: Fluido, eta: float, res: dict) -> pd.DataFrame:
+    """Tabella con tutti i passaggi intermedi del calcolo pompe."""
+    A_s = math.pi * suction.D ** 2 / 4.0
+    A_d = math.pi * discharge.D ** 2 / 4.0
+    eps_rel_s = suction.eps / suction.D
+    eps_rel_d = discharge.eps / discharge.D
+    reg_s = "laminare (f=64/Re)" if res["Re_s"] < 2300 else "turbolento (Swamee-Jain)"
+    reg_d = "laminare (f=64/Re)" if res["Re_d"] < 2300 else "turbolento (Swamee-Jain)"
+    P_kW = potenza_pompa(Q, res["H"], fluido.rho, eta) / 1000.0
 
     rows = [
-        (1,  "Raggio interno",             "R",       "D / 2",
-             f"{R:.5f}",               "m",
-             "Raggio geometrico della sezione circolare"),
-        (2,  "Tirante idraulico",          "y",       "Manning^-1(Q)",
-             f"{y:.5f}",               "m",
-             "Altezza del pelo libero, trovata per bisezione sull'equazione di Manning"),
-        (3,  "Grado di riempimento",       "beta",    "y / D",
-             f"{beta:.5f}",            "-",
-             "Frazione del diametro occupata dall'acqua (0=vuota, 1=piena)"),
-        (4,  "Angolo al centro",           "theta",   "arccos(1 - 2*y/D)",
-             f"{theta:.5f}",           "rad",
-             "Semi-angolo al centro del settore circolare bagnato"),
-        (5,  "Area bagnata",               "A",       "R^2*(theta-sin(2*theta)/2)",
-             f"{A:.6f}",               "m^2",
-             "Sezione trasversale occupata dall'acqua: ingresso in Manning"),
-        (6,  "Perimetro bagnato",          "P",       "2 * R * theta",
-             f"{P:.6f}",               "m",
-             "Lunghezza del contorno a contatto con l'acqua: ingresso in Manning"),
-        (7,  "Raggio idraulico",           "Rh",      "A / P",
-             f"{Rh:.6f}",              "m",
-             "Parametro chiave di Manning: esprime l'efficienza della sezione"),
-        (8,  "Larghezza superficie libera","T",       "2*sqrt(R^2-(R-y)^2)",
-             f"{T:.6f}",               "m",
-             "Larghezza del pelo libero: necessaria per il calcolo del numero di Froude"),
-        (9,  "Portata Manning (verifica)", "Q_calc",  "(1/n)*A*Rh^(2/3)*S^(1/2)",
-             f"{Q_calc:.6f}",          "m^3/s",
-             "Portata ricalcolata dai parametri di sezione: deve coincidere con Q input"),
-        (10, "Velocita' media",            "V",       "Q / A",
-             f"{V:.5f}",               "m/s",
-             "Velocita' media nella sezione bagnata: verificare vs V_min e V_max"),
-        (11, "Diametro idraulico",         "D_idr",   "A / T",
-             f"{D_idr_val:.5f}" if not math.isnan(D_idr_val) else "n.d.", "m",
-             "Profondita' idraulica media della sezione parzialmente piena"),
-        (12, "Numero di Froude",           "Fr",      "V / sqrt(g * A/T)",
-             f"{Fr:.5f}" if not math.isnan(Fr) else "n.d.", "-",
-             "Fr<1: moto subcritico (corretto); Fr=1: critico; Fr>1: supercritico"),
-        (13, "Energia specifica",          "E",       "y + V^2 / (2g)",
-             f"{E:.5f}",               "m",
-             "Energia totale per unita' di peso (utile per analisi del moto)"),
-        (14, "Portata piena sezione",      "Q_full",  "Manning(A_piena, P_piena)",
-             f"{Q_full:.6f}",          "m^3/s",
-             "Portata a sezione completamente piena (beta=1): limite teorico"),
-        (15, "Portata massima (beta~0.94)","Q_max",   "max Q(beta) in [0,1]",
-             f"{Q_max:.6f}",           "m^3/s",
-             "Portata massima effettiva: il picco della curva Q-beta si ha a beta~0.94"),
-        (16, "Rapporto Q / Q_max",         "Q/Q_max", "Q / Q_max",
-             f"{Q_Qmax:.5f}",          "-",
-             "Indice di utilizzo della condotta: deve essere <= 1.0"),
-        (17, "Rapporto Q / Q_full",        "Q/Q_full","Q / Q_full",
-             f"{Q_Qfull:.5f}",         "-",
-             "Riempimento normalizzato sulla portata a sezione piena"),
+        (1,  "Sezione asp. (area)",        "A_s",    "pi*Ds^2/4",
+             f"{A_s:.6f}",       "m^2",  "Area della sezione circolare della condotta di aspirazione"),
+        (2,  "Sezione mand. (area)",       "A_d",    "pi*Dd^2/4",
+             f"{A_d:.6f}",       "m^2",  "Area della sezione circolare della condotta di mandata"),
+        (3,  "Velocita' aspirazione",      "V_s",    "Q / A_s",
+             f"{res['V_s']:.4f}","m/s",  "Velocita' media del fluido nella linea di aspirazione"),
+        (4,  "Velocita' mandata",          "V_d",    "Q / A_d",
+             f"{res['V_d']:.4f}","m/s",  "Velocita' media del fluido nella linea di mandata"),
+        (5,  "Reynolds asp.",              "Re_s",   "V_s*Ds/nu",
+             f"{res['Re_s']:.0f}","-",   "Numero di Reynolds: discrimina regime laminare (Re<2300) da turbolento"),
+        (6,  "Reynolds mand.",             "Re_d",   "V_d*Dd/nu",
+             f"{res['Re_d']:.0f}","-",   "Numero di Reynolds: discrimina regime laminare (Re<2300) da turbolento"),
+        (7,  "Rugosita' relativa asp.",    "eps/Ds", "eps_s/Ds",
+             f"{eps_rel_s:.7f}", "-",    "Rugosita' relativa: ingresso nell'equazione di Swamee-Jain"),
+        (8,  "Rugosita' relativa mand.",   "eps/Dd", "eps_d/Dd",
+             f"{eps_rel_d:.7f}", "-",    "Rugosita' relativa: ingresso nell'equazione di Swamee-Jain"),
+        (9,  "Regime asp.",                "-",      "-",
+             reg_s,              "-",    "Classificazione del regime di moto nella linea di aspirazione"),
+        (10, "Regime mand.",               "-",      "-",
+             reg_d,              "-",    "Classificazione del regime di moto nella linea di mandata"),
+        (11, "Fattore attrito asp.",       "f_s",    "64/Re o Swamee-Jain",
+             f"{res['f_s']:.6f}","-",   "Fattore di attrito di Darcy-Weisbach (approx. Colebrook-White)"),
+        (12, "Fattore attrito mand.",      "f_d",    "64/Re o Swamee-Jain",
+             f"{res['f_d']:.6f}","-",   "Fattore di attrito di Darcy-Weisbach (approx. Colebrook-White)"),
+        (13, "Perdite distr. asp.",        "hf_s",   "f_s*(Ls/Ds)*V_s^2/(2g)",
+             f"{res['hf_s']:.5f}","m",  "Perdite per attrito distribuite nell'intera lunghezza di aspirazione"),
+        (14, "Perdite distr. mand.",       "hf_d",   "f_d*(Ld/Dd)*V_d^2/(2g)",
+             f"{res['hf_d']:.5f}","m",  "Perdite per attrito distribuite nell'intera lunghezza di mandata"),
+        (15, "Perdite conc. asp.",         "hK_s",   "Ks*V_s^2/(2g)",
+             f"{res['hK_s']:.5f}","m",  "Perdite concentrate per valvole, curve, raccordi in aspirazione"),
+        (16, "Perdite conc. mand.",        "hK_d",   "Kd*V_d^2/(2g)",
+             f"{res['hK_d']:.5f}","m",  "Perdite concentrate per valvole, curve, raccordi in mandata"),
+        (17, "Dislivello geodesico",       "dZ",     "z_d - z_s",
+             f"{res['dZ']:.4f}", "m",   "Componente statica del TDH: dislivello tra punto di consegna e aspirazione"),
+        (18, "Variazione cinetica",        "dVel",   "(V_d^2-V_s^2)/(2g)",
+             f"{res['dVel']:.5f}","m",  "Differenza di energia cinetica tra mandata e aspirazione"),
+        (19, "TDH totale",                 "H",      "dZ+hf_s+hf_d+hK_s+hK_d+dVel",
+             f"{res['H']:.4f}",  "m",   "Prevalenza totale dinamica: parametro di selezione della pompa"),
+        (20, "Potenza all'asse pompa",     "P",      "rho*g*Q*H/eta",
+             f"{P_kW:.4f}",      "kW",  "Potenza meccanica richiesta alla pompa (divisa per il rendimento idraulico)"),
     ]
     return pd.DataFrame(rows, columns=["Passo", "Grandezza", "Simbolo",
                                        "Formula", "Valore", "Unita", "Descrizione"])
+
+
+# ---------------------------------------------------------------------------
+# Verifiche normative complete
+# ---------------------------------------------------------------------------
+
+def verifiche_pompa(Q: float, suction: Linea, discharge: Linea,
+                    fluido: Fluido, eta: float, res: dict,
+                    n_rpm: float = 1450.0,
+                    z_serbatoio: Optional[float] = None,
+                    npsh_richiesto: float = 3.0,
+                    p_atm: float = P_ATM_STD) -> pd.DataFrame:
+    """
+    Tabella di verifiche ingegneristiche complete per il sistema pompa.
+    Colonne: N., Verifica, Valore calcolato, Limite / soglia, Esito, Riferimento normativo.
+    """
+    P_kW = potenza_pompa(Q, res["H"], fluido.rho, eta) / 1000.0
+    Ns = velocita_specifica_ns(n_rpm, Q, res["H"])
+
+    z_suct = z_serbatoio if z_serbatoio is not None else suction.z
+    hf_asp_tot = res["hf_s"] + res["hK_s"]
+    npsh_disp = npsh_disponibile(z_suct, suction.z, hf_asp_tot, fluido.rho,
+                                  p_atm, fluido.p_vap)
+    margine_npsh = npsh_disp - npsh_richiesto
+
+    ar = sovrapressione_joukowsky(res["V_d"], fluido.rho)
+    dP_bar = ar["dP [bar]"]
+
+    hK_tot = res["hK_s"] + res["hK_d"]
+    hf_tot = res["hf_s"] + res["hf_d"]
+    H = res["H"]
+
+    def esito(cond: bool, fallback: str = "ATTENZIONE") -> str:
+        return "OK" if cond else fallback
+
+    checks = [
+        (1, "Velocita asp. V_s <= 2.0 m/s",
+         f"{res['V_s']:.3f} m/s", "<= 2.0 m/s",
+         esito(res["V_s"] <= 2.0, "NON OK"), "Buona pratica progettuale / ISO 9906"),
+        (2, "Velocita mand. V_d <= 3.5 m/s",
+         f"{res['V_d']:.3f} m/s", "<= 3.5 m/s",
+         esito(res["V_d"] <= 3.5, "NON OK"), "Buona pratica progettuale"),
+        (3, "Regime asp. turbolento (Re_s > 4000)",
+         f"{res['Re_s']:.0f}", "> 4000",
+         esito(res["Re_s"] > 4000, "ATTENZIONE"), "Idraulica condotte"),
+        (4, "Regime mand. turbolento (Re_d > 4000)",
+         f"{res['Re_d']:.0f}", "> 4000",
+         esito(res["Re_d"] > 4000, "ATTENZIONE"), "Idraulica condotte"),
+        (5, "NPSH disponibile",
+         f"{npsh_disp:.2f} m",
+         f">= NPSH_r = {npsh_richiesto:.1f} m",
+         "OK" if margine_npsh >= 0.5 else ("ATTENZIONE" if margine_npsh >= 0 else "NON OK"),
+         "ISO 9906:2012, EN 12845:2015"),
+        (6, "Margine NPSH_d - NPSH_r >= 0.5 m",
+         f"{margine_npsh:.2f} m",
+         ">= 0.5 m",
+         esito(margine_npsh >= 0.5, "ATTENZIONE"), "ISO 9906:2012"),
+        (7, "Rendimento pompa eta >= 0.65",
+         f"{eta:.3f}", ">= 0.65",
+         esito(eta >= 0.65, "ATTENZIONE"), "ErP 2019/1781 UE"),
+        (8, "Perdite concentrate < 50% TDH",
+         f"{hK_tot:.3f} m ({hK_tot/H*100:.1f}% se H>0)" if H > 0 else f"{hK_tot:.3f} m",
+         "< 50% TDH",
+         esito(H <= 0 or hK_tot < 0.5 * H, "ATTENZIONE"), "Buona pratica - ridurre accessori"),
+        (9, "Perdite distribuite < 70% TDH",
+         f"{hf_tot:.3f} m ({hf_tot/H*100:.1f}%)" if H > 0 else f"{hf_tot:.3f} m",
+         "< 70% TDH",
+         esito(H <= 0 or hf_tot < 0.7 * H, "ATTENZIONE"), "Buona pratica - aumentare DN"),
+        (10, "TDH > 0 (configurazione valida)",
+         f"{H:.3f} m", "> 0",
+         esito(H > 0, "NON OK"), "Verifica configurazione impianto"),
+        (11, "Velocita specifica Ns",
+         f"{Ns:.0f}" if not math.isnan(Ns) else "n.d.",
+         "300 -- 5000 (centrifuga)",
+         "OK" if (not math.isnan(Ns) and 200 < Ns < 6000) else "ATTENZIONE",
+         "KSB Pump Handbook / Stepanoff"),
+        (12, "Sovrapressione Joukowsky (colpo ariete)",
+         f"{dP_bar:.2f} bar",
+         "Verif. vs PN condotta",
+         "INFO", "EN 805:2000, Wylie & Streeter"),
+    ]
+    df = pd.DataFrame(checks, columns=["N.", "Verifica", "Valore calcolato",
+                                        "Limite / soglia", "Esito",
+                                        "Riferimento normativo"])
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -553,29 +513,25 @@ def _pdf_riga_kv(pdf, chiave: str, valore: str) -> None:
 
 
 def _pdf_tabella_gen(pdf, df: pd.DataFrame,
-                     larghezze: Optional[Dict[str, int]] = None) -> None:
-    """Tabella generica da DataFrame nel PDF."""
+                     larghezze: Optional[dict] = None) -> None:
     cols = list(df.columns)
     lw = larghezze or {}
     default_w = max(10, int(190 / max(len(cols), 1)))
     row_h = 5
-
     pdf.set_font("Helvetica", "B", 7)
     pdf.set_fill_color(200, 220, 245)
     for col in cols:
         w = lw.get(col, default_w)
         pdf.cell(w, row_h + 1, str(col), border=1, align="C", fill=True)
     pdf.ln()
-
     pdf.set_font("Helvetica", "", 7)
     for _, row in df.iterrows():
         for col in cols:
             w = lw.get(col, default_w)
             val = row[col]
             txt = str(val) if val is not None else ""
-            align = "C" if col in ("N.", "Passo", "Simbolo", "Valore", "Unita",
-                                   "Esito", "OK beta", "OK V", "Stato globale",
-                                   "DN [mm]") else "L"
+            align = "C" if col in ("N.", "Passo", "Simbolo", "Valore", "Unita", "Esito",
+                                   "Valore [m]", "% su TDH") else "L"
             max_c = max(4, int(w / 1.85))
             if len(txt) > max_c:
                 txt = txt[: max_c - 2] + ".."
@@ -583,158 +539,146 @@ def _pdf_tabella_gen(pdf, df: pd.DataFrame,
         pdf.ln()
 
 
-def genera_pdf(dati: DatiCondotta, res: dict, note: List[str],
-               materiale: str = "", uso: str = "") -> bytes:
+def genera_pdf(Q: float, suction: Linea, discharge: Linea,
+               fluido: Fluido, eta: float, res: dict, note: List[str],
+               n_rpm: float = 1450.0, z_serbatoio: Optional[float] = None,
+               npsh_richiesto: float = 3.0, ore_annue: float = 2000.0,
+               costo_kwh: float = 0.15, eta_motore: float = 0.92) -> bytes:
     """Genera un report PDF completo e restituisce i bytes."""
     from fpdf import FPDF
 
-    df_pass = tabella_passaggi(dati, res)
-    df_ver = verifiche_idrauliche(dati, res, materiale or list(MATERIALI_MANNING.keys())[2], uso)
-    df_dn = confronto_diametri(dati.n, dati.S, dati.Q, dati.D, materiale or list(MATERIALI_MANNING.keys())[2], uso)
+    df_pass = tabella_passaggi(Q, suction, discharge, fluido, eta, res)
+    df_bkd = breakdown_perdite(res)
+    df_ver = verifiche_pompa(Q, suction, discharge, fluido, eta, res,
+                              n_rpm, z_serbatoio, npsh_richiesto)
+    P_kW = potenza_pompa(Q, res["H"], fluido.rho, eta) / 1000.0
+    Ns = velocita_specifica_ns(n_rpm, Q, res["H"])
+    en = costo_energetico_annuo(P_kW, ore_annue, costo_kwh, eta_motore)
+    ar = sovrapressione_joukowsky(res["V_d"], fluido.rho)
 
-    lw_pass = {"Passo": 8, "Grandezza": 36, "Simbolo": 16,
-               "Formula": 48, "Valore": 24, "Unita": 14, "Descrizione": 44}
-    lw_ver = {"N.": 8, "Verifica": 68, "Valore calcolato": 30,
-              "Limite / soglia": 28, "Esito": 18, "Riferimento normativo": 38}
-    lw_dn = {"DN [mm]": 15, "beta [-]": 15, "V [m/s]": 14, "Fr [-]": 12,
-             "Q_max [m3/s]": 22, "Q/Q_max [-]": 20, "OK beta": 15,
-             "OK V": 12, "Stato globale": 25, "Nota": 30}
+    lw_pass = {"Passo": 9, "Grandezza": 35, "Simbolo": 18,
+               "Formula": 45, "Valore": 24, "Unita": 14, "Descrizione": 45}
+    lw_bkd = {"Componente": 100, "Valore [m]": 30, "% su TDH": 25}
+    lw_ver = {"N.": 8, "Verifica": 65, "Valore calcolato": 28,
+              "Limite / soglia": 28, "Esito": 18, "Riferimento normativo": 43}
 
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Titolo
-    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_font("Helvetica", "B", 15)
     pdf.set_fill_color(20, 50, 110)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, "Report - Condotta Circolare (Moto Uniforme - Manning)",
+    pdf.cell(0, 12, "Report - Prevalenza Pompa (TDH) e Verifiche Sistema",
              ln=True, align="C", fill=True)
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Helvetica", "", 8)
-    pdf.cell(0, 6, f"Generato il {datetime.date.today().strftime('%d/%m/%Y')}  |  "
-             f"Materiale: {materiale}  |  Uso: {uso}", ln=True, align="C")
+    pdf.cell(0, 6, f"Generato il {datetime.date.today().strftime('%d/%m/%Y')}", ln=True, align="C")
     pdf.ln(4)
 
-    # Input
     _pdf_sezione(pdf, "1. Parametri di input")
-    _pdf_riga_kv(pdf, "Diametro D", f"{dati.D:.4f} m  (DN {int(round(dati.D*1000))} mm)")
-    _pdf_riga_kv(pdf, "Coefficiente Manning n", f"{dati.n:.4f}  (materiale: {materiale})")
-    _pdf_riga_kv(pdf, "Pendenza idraulica S", f"{dati.S:.6f}")
-    _pdf_riga_kv(pdf, "Portata di progetto Q", f"{dati.Q:.5f} m3/s")
-    _pdf_riga_kv(pdf, "Uso previsto", uso)
+    _pdf_riga_kv(pdf, "Portata Q", f"{Q:.5f} m3/s")
+    _pdf_riga_kv(pdf, "Densita fluido rho", f"{fluido.rho:.2f} kg/m3")
+    _pdf_riga_kv(pdf, "Viscosita nu", f"{fluido.nu:.4e} m2/s")
+    _pdf_riga_kv(pdf, "Pressione vapore p_vap", f"{fluido.p_vap:.0f} Pa")
+    _pdf_riga_kv(pdf, "Rendimento pompa eta", f"{eta:.3f}")
+    _pdf_riga_kv(pdf, "Velocita di rotazione n", f"{n_rpm:.0f} giri/min")
+    _pdf_riga_kv(pdf, "Asp.: L/D/eps/K/z",
+                 f"{suction.L:.1f}m / {suction.D:.3f}m / {suction.eps:.5f}m / {suction.K_tot:.1f} / {suction.z:.2f}m")
+    _pdf_riga_kv(pdf, "Mand.: L/D/eps/K/z",
+                 f"{discharge.L:.1f}m / {discharge.D:.3f}m / {discharge.eps:.5f}m / {discharge.K_tot:.1f} / {discharge.z:.2f}m")
     pdf.ln(4)
 
-    # Risultati
-    _pdf_sezione(pdf, "2. Risultati principali al punto di progetto")
-    _pdf_riga_kv(pdf, "Tirante y", f"{res['y']:.5f} m")
-    _pdf_riga_kv(pdf, "Grado riempimento beta = y/D", f"{res['beta']:.5f}")
-    _pdf_riga_kv(pdf, "Area bagnata A", f"{res['A']:.6f} m2")
-    _pdf_riga_kv(pdf, "Perimetro bagnato P", f"{res['P']:.6f} m")
-    _pdf_riga_kv(pdf, "Raggio idraulico Rh", f"{res['Rh']:.6f} m")
-    _pdf_riga_kv(pdf, "Velocita media V", f"{res['V']:.4f} m/s")
-    _pdf_riga_kv(pdf, "Numero di Froude Fr", f"{res['Fr']:.4f}  ({classifica_moto(res['Fr'])})"
-                 if not math.isnan(res["Fr"]) else "n.d.")
-    _pdf_riga_kv(pdf, "Energia specifica E", f"{res['E']:.5f} m")
-    _pdf_riga_kv(pdf, "Q piena sezione Q_full", f"{res['Q_full']:.5f} m3/s")
-    _pdf_riga_kv(pdf, "Q massima Q_max (beta~0.94)", f"{res['Q_max']:.5f} m3/s")
-    _pdf_riga_kv(pdf, "Q / Q_max", f"{dati.Q / res['Q_max']:.4f}")
+    _pdf_sezione(pdf, "2. Risultati principali")
+    _pdf_riga_kv(pdf, "TDH totale", f"{res['H']:.4f} m")
+    _pdf_riga_kv(pdf, "Potenza all'asse pompa P", f"{P_kW:.3f} kW")
+    _pdf_riga_kv(pdf, "V_s (aspirazione)", f"{res['V_s']:.4f} m/s  |  Re_s = {res['Re_s']:.0f}")
+    _pdf_riga_kv(pdf, "V_d (mandata)", f"{res['V_d']:.4f} m/s  |  Re_d = {res['Re_d']:.0f}")
+    _pdf_riga_kv(pdf, "f_s (Darcy-Weisbach asp.)", f"{res['f_s']:.6f}")
+    _pdf_riga_kv(pdf, "f_d (Darcy-Weisbach mand.)", f"{res['f_d']:.6f}")
+    _pdf_riga_kv(pdf, "Velocita specifica Ns", f"{Ns:.0f}  ->  {tipo_pompa_da_ns(Ns)}" if not math.isnan(Ns) else "n.d.")
+    _pdf_riga_kv(pdf, "NPSH disponibile", f"{npsh_disponibile(z_serbatoio or suction.z, suction.z, res['hf_s']+res['hK_s'], fluido.rho, P_ATM_STD, fluido.p_vap):.3f} m")
+    _pdf_riga_kv(pdf, "Sovrapressione Joukowsky", f"{ar['dP [bar]']:.2f} bar  ({ar['dP [m c.a.]']:.1f} m c.a.)")
+    _pdf_riga_kv(pdf, "Costo energetico annuo", f"{en['Costo annuo [EUR]']:.0f} EUR/anno  ({en['Energia annua [kWh]']:.0f} kWh/anno)")
     pdf.ln(4)
 
-    # Passaggi
-    _pdf_sezione(pdf, "3. Passaggi di calcolo (passo per passo)")
+    _pdf_sezione(pdf, "3. Dettaglio componenti TDH")
+    _pdf_tabella_gen(pdf, df_bkd, lw_bkd)
+    pdf.ln(4)
+
+    _pdf_sezione(pdf, "4. Passaggi di calcolo")
     _pdf_tabella_gen(pdf, df_pass, lw_pass)
-    pdf.ln(4)
 
-    # Verifiche
     pdf.add_page()
-    _pdf_sezione(pdf, "4. Verifiche normative (tabella semaforo)")
+    _pdf_sezione(pdf, "5. Verifiche normative")
     _pdf_tabella_gen(pdf, df_ver, lw_ver)
     pdf.ln(4)
 
-    # Confronto DN
-    _pdf_sezione(pdf, "5. Confronto diametri DN standard adiacenti")
-    _pdf_tabella_gen(pdf, df_dn, lw_dn)
-    pdf.ln(4)
-
-    # Note
-    _pdf_sezione(pdf, "6. Note tecniche e commenti progettuali")
+    _pdf_sezione(pdf, "6. Note tecniche")
     pdf.set_font("Helvetica", "", 8)
     for item in note:
         pdf.multi_cell(0, 5, "- " + item)
         pdf.ln(1)
 
-    return bytes(pdf.output())
+    return pdf.output()
 
 
 # ---------------------------------------------------------------------------
 # Commenti progettuali automatici
 # ---------------------------------------------------------------------------
 
-def commenti_progettuali(dati: DatiCondotta, res: dict,
-                         materiale: str = "", uso: str = "") -> List[str]:
+def commenti_progettuali(Q: float, suction: Linea, discharge: Linea,
+                          fluido: Fluido, res: dict, eta: float) -> List[str]:
     note: List[str] = []
-    beta = res["beta"]
-    V = res["V"]
-    Q_max = res["Q_max"]
-    Q_full = res["Q_full"]
-    Fr = res["Fr"]
+    Re_s, Re_d = res["Re_s"], res["Re_d"]
+    V_s, V_d = res["V_s"], res["V_d"]
+    H = res["H"]
+    hK_tot = res["hK_s"] + res["hK_d"]
+    hf_tot = res["hf_s"] + res["hf_d"]
 
-    mat = MATERIALI_MANNING.get(materiale, {})
-    V_max_mat = mat.get("V_max", 5.0)
-    V_min = V_MIN_AUTOCIRCOLANTE.get(uso, 0.60)
-    n_materiale = mat.get("n", None)
-
-    if beta > 0.94:
+    if Re_s < 4000:
         note.append(
-            f"Grado di riempimento critico (beta = {beta:.3f} > 0.94): la portata supera il massimo "
-            "teorico della sezione. Incrementare il diametro o la pendenza."
+            f"Linea asp. in regime laminare/transitorio (Re = {Re_s:.0f}): f = 64/Re. "
+            "Aumentare il diametro per passare a regime turbolento."
         )
-    elif beta > 0.80:
+    if Re_d < 4000:
         note.append(
-            f"Grado di riempimento elevato (beta = {beta:.3f} > 0.80): verificare margine di sicurezza, "
-            "ventilazione e condizioni di piena eccezionale."
+            f"Linea mand. in regime laminare/transitorio (Re = {Re_d:.0f}): f = 64/Re."
         )
-    elif beta < 0.10:
+    if V_s > 2.0:
         note.append(
-            f"Grado di riempimento molto basso (beta = {beta:.3f} < 0.10): la sezione e' "
-            "sovradimensionata. Verificare le condizioni di moto a bassa portata."
+            f"Velocita asp. elevata ({V_s:.2f} m/s > 2.0 m/s): rischio cavitazione. "
+            "Verificare NPSH disponibile e aumentare il diametro di aspirazione."
         )
-
-    if not math.isnan(V):
-        if V < V_min:
-            note.append(
-                f"Velocita media V = {V:.3f} m/s inferiore al minimo autocircolante {V_min:.2f} m/s "
-                f"per uso '{uso}'. Rischio deposito sedimenti; aumentare la pendenza o ridurre il diametro."
-            )
-        elif V > V_max_mat:
-            note.append(
-                f"Velocita media V = {V:.3f} m/s supera il limite del materiale ({V_max_mat:.1f} m/s per "
-                f"{materiale}). Rischio di abrasione/erosione interna."
-            )
-
-    if n_materiale and abs(dati.n - n_materiale) > 0.003:
+    if V_d > 3.5:
         note.append(
-            f"Il valore di Manning n = {dati.n:.4f} differisce dal valore tipico del materiale "
-            f"'{materiale}' (n_tipico = {n_materiale:.3f}). Verificare lo stato di conservazione."
+            f"Velocita mand. elevata ({V_d:.2f} m/s > 3.5 m/s): verificare abrasione "
+            "e colpo d'ariete alla chiusura valvola."
         )
-
-    if not math.isnan(Fr) and Fr > 1.0:
+    if H > 0 and hK_tot > 0.5 * H:
         note.append(
-            f"Moto supercritico (Fr = {Fr:.3f} > 1.0): attenzione ai risalti idraulici e alle "
-            "transizioni di sezione. Progettare con cautela gli elementi dissipatori."
+            f"Perdite concentrate ({hK_tot:.2f} m) > 50% del TDH: ridurre accessori, "
+            "aumentare i diametri, ridistribuire i carichi locali."
         )
-
-    ratio_Q = dati.Q / Q_max if Q_max > 0 else float("nan")
-    note.append(
-        f"Portata di progetto Q = {dati.Q:.5f} m3/s  |  "
-        f"Q_max(beta=0.94) = {Q_max:.5f} m3/s  |  "
-        f"Q_full(beta=1.0) = {Q_full:.5f} m3/s  |  Q/Q_max = {ratio_Q:.3f}."
-    )
-
-    if not any(k in " ".join(note[:-1]) for k in ("critico", "elevato", "basso", "inferiore",
-                                                    "supera", "differisce", "supercritico")):
-        note.insert(0,
-                    "Tutti i parametri idraulici rientrano nei limiti normativi tipici. "
-                    "Completare la verifica con l'analisi di piena e le condizioni al contorno.")
+    if H > 0 and hf_tot > 0.7 * H:
+        note.append(
+            f"Perdite distribuite ({hf_tot:.2f} m) > 70% del TDH: valutare l'aumento "
+            "del diametro delle tubazioni per ridurre le perdite."
+        )
+    if eta < 0.65:
+        note.append(
+            f"Rendimento basso (eta = {eta:.2f} < 0.65): verificare il punto di lavoro "
+            "sulla curva caratteristica e l'invecchiamento della macchina."
+        )
+    if H < 0:
+        note.append(
+            "TDH negativo: verificare le quote z_s, z_d, i segni delle perdite e la "
+            "configurazione dell'impianto."
+        )
+    if not note:
+        note.append(
+            "I parametri rientrano in un intervallo operativo tipico. "
+            "Completare la verifica con la curva caratteristica della pompa, l'analisi NPSH "
+            "e la stima del colpo d'ariete."
+        )
     return note
