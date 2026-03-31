@@ -319,7 +319,14 @@ def breakdown_perdite(res: dict) -> pd.DataFrame:
         {"Componente": "TDH totale",                      "Valore [m]": round(res["H"], 4)},
     ]
     df = pd.DataFrame(rows)
-    df["% su TDH"] = (df["Valore [m]"] / res["H"] * 100).round(1).where(res["H"] != 0, None)
+    
+    # RISOLUZIONE ERRORE: 
+    # Usiamo un costrutto if-else logico invece di un .where() di pandas su uno scalare
+    if res["H"] != 0:
+        df["% su TDH"] = (df["Valore [m]"] / res["H"] * 100).round(1)
+    else:
+        df["% su TDH"] = None
+        
     return df
 
 
