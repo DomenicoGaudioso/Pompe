@@ -1,0 +1,26 @@
+{
+  "repo": "Pompe",
+  "suite": "Idraulica",
+  "role": "verifica del sollevamento e della prevalenza richiesta",
+  "logic_chain": "pioggia -> drenaggio piattaforma -> condotte -> pompe",
+  "upstream": ["DatiPluviometrici", "IdraulicaPiattaforma", "Condotte"],
+  "downstream": [],
+  "primary_inputs": [
+    "portata di progetto",
+    "linea di aspirazione",
+    "linea di mandata",
+    "fluido",
+    "rendimento"
+  ],
+  "primary_outputs": [
+    "TDH",
+    "potenza richiesta",
+    "NPSH disponibile",
+    "curve TDH(Q)",
+    "costo energetico"
+  ],
+  "implementation_notes": [
+    "La portata di progetto deve essere coerente con Condotte o IdraulicaPiattaforma.",
+    "La verifica NPSH chiude il controllo impiantistico."
+  ]
+}

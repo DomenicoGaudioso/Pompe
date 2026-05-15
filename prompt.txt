@@ -14,7 +14,7 @@ La versione attuale è completa nei requisiti di base. Funzionalità implementat
 - breakdown_perdite(): DataFrame per barchart e CSV.
 - curva_tdh_vs_Q(): DataFrame 50 punti da 0.10·Q a 2.0·Q.
 - commenti_progettuali(): note su regime, velocità, perdite, rendimento.
-- app.py: layout wide, 5 metriche, 3 tab, barchart perdite, curva TDH(Q),
+- app.py: layout wide, risultati principali tabellati, 3 tab, barchart perdite, curva TDH(Q),
   marcatura punto di lavoro, download CSV.
 
 STANDARD DELLA SUITE

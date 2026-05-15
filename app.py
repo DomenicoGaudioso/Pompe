@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import json
+import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from word_report import genera_relazione_word
 from src import (Fluido, Linea, valida_dati, tdh_pump, potenza_pompa,
                  breakdown_perdite, curva_tdh_vs_Q, tabella_passaggi,
                  genera_pdf, commenti_progettuali,
@@ -183,29 +185,36 @@ costi = costo_energetico_annuo(P_kW, ore_annue, costo_kwh, eta_motore)
 df_ver = verifiche_pompa(Q, suction, discharge, fluido, eta, res,
                           n_rpm=n_rpm, z_serbatoio=z_serb,
                           npsh_richiesto=npsh_r)
+df_formule_word = pd.DataFrame([
+    {"Grandezza": "TDH", "Formula": "H = Delta z + hf + hK + Delta(V^2/2g)", "Nota": "Prevalenza totale del sistema"},
+    {"Grandezza": "Darcy-Weisbach", "Formula": "hf = f (L/D) V^2/(2g)", "Nota": "Perdite distribuite"},
+    {"Grandezza": "Perdite concentrate", "Formula": "hK = K V^2/(2g)", "Nota": "Valvole, curve e imbocchi"},
+    {"Grandezza": "Potenza asse", "Formula": "P = rho g Q H / eta", "Nota": "Potenza richiesta alla pompa"},
+    {"Grandezza": "NPSH disponibile", "Formula": "NPSHd = (patm-pvap)/(rho g) + zserb - zpompa - hf_asp", "Nota": "Verifica cavitazione"},
+])
 
 # ---------------------------------------------------------------------------
-# Indicatori sintetici
+# Risultati principali tabellati
 # ---------------------------------------------------------------------------
 n_ok  = (df_ver["Esito"] == "OK").sum()
 n_att = (df_ver["Esito"] == "ATTENZIONE").sum()
 n_no  = (df_ver["Esito"] == "NON OK").sum()
-
-col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
-col1.metric("TDH [m]", f"{res['H']:.2f}")
-col2.metric("Potenza asse [kW]", f"{P_kW:.2f}")
-col3.metric("NPSH disp. [m]", f"{npsh_d:.2f}",
-            delta="OK" if npsh_d >= npsh_r else "CRIT.",
-            delta_color="normal" if npsh_d >= npsh_r else "inverse")
-col4.metric("Ns [-]", f"{Ns:.0f}" if Ns == Ns else "n.d.")
-col5.metric("V asp [m/s]", f"{res['V_s']:.2f}")
-col6.metric("V mand [m/s]", f"{res['V_d']:.2f}")
-col7.metric("Verif. OK / WARN / NO", f"{n_ok} / {n_att} / {n_no}", delta_color="off")
+df_risultati_principali = pd.DataFrame([
+    {"Parametro": "TDH", "Valore": f"{res['H']:.2f}", "Unita": "m", "Esito/nota": "-"},
+    {"Parametro": "Potenza asse", "Valore": f"{P_kW:.2f}", "Unita": "kW", "Esito/nota": "-"},
+    {"Parametro": "NPSH disponibile", "Valore": f"{npsh_d:.2f}", "Unita": "m", "Esito/nota": "OK" if npsh_d >= npsh_r else "CRITICO"},
+    {"Parametro": "Ns", "Valore": f"{Ns:.0f}" if Ns == Ns else "n.d.", "Unita": "-", "Esito/nota": tipo_pompa_da_ns(Ns)},
+    {"Parametro": "Velocita aspirazione", "Valore": f"{res['V_s']:.2f}", "Unita": "m/s", "Esito/nota": "-"},
+    {"Parametro": "Velocita mandata", "Valore": f"{res['V_d']:.2f}", "Unita": "m/s", "Esito/nota": "-"},
+    {"Parametro": "Verifiche", "Valore": f"{n_ok} OK / {n_att} ATTENZIONE / {n_no} NON OK", "Unita": "-", "Esito/nota": "riepilogo tabellare"},
+])
+st.subheader("Risultati principali")
+st.dataframe(df_risultati_principali, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Risultati", "Grafici", "Verifiche avanzate", "Note tecniche"])
+tab1, tab2, tab3, tab4 = [st.container() for _ in range(4)]
 
 with tab1:
     st.subheader("Passaggi di calcolo (passo per passo)")
@@ -237,7 +246,7 @@ with tab1:
     st.dataframe(df_perdite, use_container_width=True, hide_index=True)
 
     st.divider()
-    col_dl1, col_dl2, col_dl3, col_dl4 = st.columns(4)
+    col_dl1, col_dl2, col_dl3, col_dl4, col_dl5 = st.columns(5)
     with col_dl1:
         st.download_button("Scarica passaggi CSV",
                            df_pass.to_csv(index=False).encode("utf-8"),
@@ -261,6 +270,37 @@ with tab1:
                                "pompa_report.pdf", "application/pdf")
         except ImportError:
             st.warning("fpdf2 non installato. Eseguire: pip install fpdf2")
+    with col_dl5:
+        word_bytes = genera_relazione_word(
+            "Relazione tecnica - Prevalenza e potenza pompa",
+            "Calcolo TDH con Darcy-Weisbach, NPSH, colpo d'ariete e risultati tabellati.",
+            [
+                {"Parametro": "Fluido", "Valore": fluido_preset, "Unita": "-", "Esito/nota": f"rho={rho:.2f} kg/m3"},
+                {"Parametro": "Portata Q", "Valore": f"{Q:.2f}", "Unita": "m3/s", "Esito/nota": "-"},
+                {"Parametro": "Diametro aspirazione", "Valore": f"{Ds:.2f}", "Unita": "m", "Esito/nota": mat_asp},
+                {"Parametro": "Diametro mandata", "Valore": f"{Dd:.2f}", "Unita": "m", "Esito/nota": mat_mand},
+                {"Parametro": "Rendimento pompa", "Valore": f"{eta:.2f}", "Unita": "-", "Esito/nota": "-"},
+                {"Parametro": "NPSH richiesto", "Valore": f"{npsh_r:.2f}", "Unita": "m", "Esito/nota": "-"},
+            ],
+            df_formule_word,
+            [
+                ("Risultati principali", df_risultati_principali),
+                ("Passaggi di calcolo", df_pass),
+                ("Dettaglio componenti della prevalenza", df_perdite),
+                ("Verifiche pompa", df_ver),
+            ],
+            note,
+            figures=[
+                {"title": "Curva sistema TDH(Q)", "df": df_curva, "x": "Q [m3/s]", "y": "TDH [m]", "kind": "line", "ylabel": "TDH [m]"},
+                {"title": "Componenti della prevalenza", "df": df_perdite[df_perdite["Componente"] != "TDH totale"], "x": "Componente", "y": "Valore [m]", "kind": "bar", "ylabel": "m c.a.", "rotation": 25},
+            ],
+        )
+        st.download_button(
+            "Scarica relazione Word",
+            word_bytes,
+            "relazione_pompa.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
 with tab2:
     st.subheader("Distribuzione delle perdite")

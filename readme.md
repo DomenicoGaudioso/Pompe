@@ -16,7 +16,7 @@ Funzionalità implementate:
 - Curva sistema TDH(Q) da 0.10·Q a 2.0·Q (50 punti).
 - Validazione dati con messaggi esplicativi.
 - Commenti progettuali automatici (regime laminare, cavitazione, perdite dominate).
-- Layout `wide`, 5 metriche sintetiche, 3 tab (Risultati / Grafici / Note tecniche).
+- Layout `wide`, risultati principali tabellati, 3 tab (Risultati / Grafici / Note tecniche).
 - Grafici Plotly: barchart perdite e curva TDH(Q) con marcatura del punto di lavoro.
 - Export CSV (dettaglio perdite + curva TDH).
 
